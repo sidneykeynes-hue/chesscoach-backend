@@ -59,6 +59,16 @@ PUZZLE_GROUPS = [
 
 STOCKFISH_POOL_SIZE = int(os.getenv("STOCKFISH_POOL_SIZE", "3"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+
+# Premium feature flag — set PREMIUM_ENABLED=true in Railway to activate
+PREMIUM_ENABLED = os.getenv("PREMIUM_ENABLED", "false").lower() == "true"
+FREE_MAX_ANALYSES = 3
+FREE_MAX_GAMES = 5
+PREMIUM_MAX_GAMES = 20
+# Bypass list for dev/testing — comma-separated user_ids exempt from limits
+# Example: BYPASS_PREMIUM_USER_IDS=user_123abc,user_456def
+_bypass_raw = os.getenv("BYPASS_PREMIUM_USER_IDS", "")
+BYPASS_PREMIUM_USER_IDS: set = {uid.strip() for uid in _bypass_raw.split(",") if uid.strip()}
 REDIS_TTL_EVAL = 3600    # 1h pour les évaluations de position
 REDIS_TTL_PROFILE = 86400  # 24h pour les profils joueurs
 
@@ -219,6 +229,7 @@ async def startup_event():
         await db.user_puzzle_history.create_index([("user_id", 1), ("puzzle_id", 1)])
         await db.user_puzzle_history.create_index([("user_id", 1), ("created_at", -1)])
         await db.player_profiles.create_index([("user_id", 1)])
+        await db.user_usage.create_index([("user_id", 1)], unique=True)
     except Exception as e:
         logging.warning(f"Erreur création index: {e}")
 
@@ -891,6 +902,7 @@ async def analyze_position_stockfish(fen: str) -> Dict[str, Any]:
     return result
 
 def classify_move_cpl(cpl: float) -> str:
+    """Used for batch game analysis (post-import). Strict thresholds."""
     if cpl <= 15:
         return "best"
     if cpl <= 50:
@@ -898,6 +910,20 @@ def classify_move_cpl(cpl: float) -> str:
     if cpl <= 100:
         return "inaccuracy"
     if cpl <= 300:
+        return "mistake"
+    return "blunder"
+
+
+def classify_move_cpl_live(cpl: float) -> str:
+    """Used for real-time coach evaluation. More lenient thresholds to avoid
+    false positives due to shallow analysis (80ms depth-12 on Railway)."""
+    if cpl <= 20:
+        return "best"
+    if cpl <= 60:
+        return "ok"
+    if cpl <= 130:
+        return "inaccuracy"
+    if cpl <= 400:
         return "mistake"
     return "blunder"
 
@@ -1997,6 +2023,28 @@ def build_player_profile(
         "archetype": archetype,
     }
 
+@api_router.get("/user/usage/{user_id}")
+async def get_user_usage(user_id: str):
+    usage = await db.user_usage.find_one({"user_id": user_id}, {"_id": 0})
+    if not usage:
+        return {
+            "imports_count": 0,
+            "is_premium": False,
+            "limit": FREE_MAX_ANALYSES,
+            "max_games": FREE_MAX_GAMES,
+            "premium_enabled": PREMIUM_ENABLED,
+        }
+    max_games = PREMIUM_MAX_GAMES if usage.get("is_premium") else FREE_MAX_GAMES
+    limit = None if usage.get("is_premium") else FREE_MAX_ANALYSES
+    return {
+        "imports_count": usage["imports_count"],
+        "is_premium": usage.get("is_premium", False),
+        "limit": limit,
+        "max_games": max_games,
+        "premium_enabled": PREMIUM_ENABLED,
+    }
+
+
 @api_router.get("/chessdotcom/stats/{username}")
 async def get_chesscom_stats(username: str):
     stats_data = await fetch_chesscom_json(
@@ -2022,6 +2070,14 @@ async def evaluate_move(payload: MoveEvalRequest):
     cp_before = eval_before.get("cp")
     cp_after = eval_after.get("cp")
 
+    # Cap mate scores to avoid false blunder classification.
+    # Without this, missing a forced mate (e.g. +10000 → +500) generates 9500cp "blunder".
+    LIVE_MAT_CAP = 700
+    if cp_before is not None:
+        cp_before = max(-LIVE_MAT_CAP, min(LIVE_MAT_CAP, cp_before))
+    if cp_after is not None:
+        cp_after = max(-LIVE_MAT_CAP, min(LIVE_MAT_CAP, cp_after))
+
     cpl = 0.0
     if cp_before is not None and cp_after is not None:
         if player_is_white:
@@ -2029,7 +2085,8 @@ async def evaluate_move(payload: MoveEvalRequest):
         else:
             cpl = max(0.0, cp_after - cp_before)
 
-    classification = classify_move_cpl(cpl)
+    # Use lenient live thresholds (shallow 80ms analysis can swing wildly)
+    classification = classify_move_cpl_live(cpl)
     accuracy = max(0.0, round(100 - (cpl / 10), 1))
 
     return {
@@ -2112,6 +2169,21 @@ async def import_chesscom_games(username: str, payload: Optional[ChessComImportR
         payload = ChessComImportRequest(user_id=username)
     if not payload.user_id:
         raise HTTPException(status_code=400, detail="user_id requis")
+
+    user_id = payload.user_id
+
+    # Premium gating — only active when PREMIUM_ENABLED=true
+    if PREMIUM_ENABLED and user_id not in BYPASS_PREMIUM_USER_IDS:
+        usage = await db.user_usage.find_one({"user_id": user_id}) or {"imports_count": 0, "is_premium": False}
+        if not usage.get("is_premium") and usage["imports_count"] >= FREE_MAX_ANALYSES:
+            raise HTTPException(status_code=403, detail={
+                "code": "LIMIT_REACHED",
+                "message": "Limite de 3 analyses gratuites atteinte",
+                "imports_count": usage["imports_count"],
+                "limit": FREE_MAX_ANALYSES,
+            })
+        if not usage.get("is_premium"):
+            payload.max_games = FREE_MAX_GAMES
 
     months = payload.months if payload.months and payload.months > 0 else 3
     months = min(12, months)
@@ -2378,7 +2450,19 @@ async def import_chesscom_games(username: str, payload: Optional[ChessComImportR
             upsert=True,
         )
 
-    payload = {
+    # Increment usage counter after successful import
+    if PREMIUM_ENABLED and user_id not in BYPASS_PREMIUM_USER_IDS:
+        await db.user_usage.update_one(
+            {"user_id": user_id},
+            {
+                "$inc": {"imports_count": 1},
+                "$set": {"updated_at": datetime.utcnow()},
+                "$setOnInsert": {"is_premium": False, "created_at": datetime.utcnow()},
+            },
+            upsert=True,
+        )
+
+    result_payload = {
         "imported": len(games),
         "games": summary_games,
         "months": months,
@@ -2386,7 +2470,7 @@ async def import_chesscom_games(username: str, payload: Optional[ChessComImportR
         "profile": profile,
         "puzzle_pack": puzzle_pack,
     }
-    return JSONResponse(content=jsonable_encoder(payload, custom_encoder={ObjectId: str}))
+    return JSONResponse(content=jsonable_encoder(result_payload, custom_encoder={ObjectId: str}))
 
 @api_router.get("/chessdotcom/games")
 async def get_chesscom_games(user_id: str, username: Optional[str] = None, limit: int = 200):
