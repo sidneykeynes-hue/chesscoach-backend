@@ -2255,13 +2255,19 @@ async def analyze_game_endpoint(payload: AnalyzeGameRequest):
         if m["is_player_move"] and m["classification"] == "best"
     ) or "aucun"
 
-    # ─── Per-move AI comments (blunders + mistakes + brilliants, max 5) ───────
-    key_indices = [
-        i for i, m in enumerate(moves_data)
-        if m["is_player_move"] and m["classification"] in ("blunder", "mistake", "brilliant")
-    ][:5]
+    # ─── Per-move AI comments (blunders + mistakes + inaccuracies, max 5) ──────
+    # Priority: blunders first, then mistakes, then inaccuracies
+    ai_client = get_openai_client()  # separate from MongoDB 'client' variable
 
-    if client and key_indices:
+    key_indices = sorted(
+        [
+            i for i, m in enumerate(moves_data)
+            if m["is_player_move"] and m["classification"] in ("blunder", "mistake", "inaccuracy")
+        ],
+        key=lambda i: {"blunder": 0, "mistake": 1, "inaccuracy": 2}[moves_data[i]["classification"]]
+    )[:5]
+
+    if ai_client and key_indices:
         def _gen_comments():
             comments = {}
             fens = [moves_data[i]["fen_after"] for i in range(len(moves_data))]
@@ -2281,7 +2287,7 @@ async def analyze_game_endpoint(payload: AnalyzeGameRequest):
                     f"Style Coach Rasta."
                 )
                 try:
-                    resp = client.chat.completions.create(
+                    resp = ai_client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[
                             {"role": "system", "content": RASTA_SYSTEM},
@@ -2302,7 +2308,7 @@ async def analyze_game_endpoint(payload: AnalyzeGameRequest):
 
     # ─── Global game analysis ─────────────────────────────────────────────────
     global_analysis = None
-    if client and len(moves_data) > 0:
+    if ai_client and len(moves_data) > 0:
         def _gen_global():
             prompt = (
                 f"Analyse complète d'une partie d'échecs.\n"
@@ -2322,7 +2328,7 @@ async def analyze_game_endpoint(payload: AnalyzeGameRequest):
                 f"Style : Coach Rasta, piquant, décadent, mais ultra-constructif. 180 mots max."
             )
             try:
-                resp = client.chat.completions.create(
+                resp = ai_client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
                         {"role": "system", "content": RASTA_SYSTEM},
