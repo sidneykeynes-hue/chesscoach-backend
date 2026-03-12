@@ -2198,24 +2198,28 @@ async def analyze_game_endpoint(payload: AnalyzeGameRequest):
             "comment": None,  # filled below for key moments
         })
 
-    # ─── Coach Rasta system prompt ────────────────────────────────────────────
+    # ─── Coach Rasta system prompt — sérieux, analytique, style chess.com ──────
     RASTA_SYSTEM = (
-        "Tu es Coach Rasta — coach d'échecs exigeant, analytique et un peu décadent. "
-        "Tu analyses les parties avec profondeur, humour piquant et sévérité bienveillante. "
-        "Style : direct, parfois brutal, toujours constructif. Métaphores absurdes bienvenues. "
-        "Tu ne ménages pas tes mots mais tu veux vraiment que le joueur progresse. "
-        "Règles : analyse la position AVANT le coup joué ; identifie le plan stratégique du joueur "
-        "vs le plan correct ; relie les erreurs aux tendances récurrentes du joueur si possible ; "
-        "distingue erreur tactique / erreur stratégique / mauvais plan. "
-        "Langue : français uniquement."
+        "Tu es Coach Rasta, coach d'échecs professionnel et analyste. "
+        "Ton style : sérieux, précis, pédagogique. Tu analyses chaque position avec rigueur, "
+        "comme un commentateur professionnel (style Kasparov Academy ou analyse chess.com). "
+        "Tu identifies clairement : la structure de pions, l'activité des pièces, les plans tactiques disponibles, "
+        "les erreurs stratégiques. Tu relies chaque erreur à un principe concret d'échecs. "
+        "Quand le profil du joueur est fourni, tu références explicitement ses statistiques "
+        "(précision, faiblesses récurrentes, rating) pour personnaliser le diagnostic. "
+        "Format commentaire coup : 2-3 phrases max. Commence par décrire la position, "
+        "puis explique pourquoi le coup est problématique, puis donne le plan correct. "
+        "Pas de 'street speak', pas de familiarité excessive — coach professionnel et exigeant. "
+        "Langue : français uniquement. Sois direct et factuel."
     )
 
     # ─── Fetch player profile for contextual analysis ─────────────────────────
     player_stats_context = ""
     if payload.username:
         try:
+            username_lower = payload.username.lower()
             profile = await db.player_profiles.find_one(
-                {"$or": [{"username": payload.username}, {"chesscom_username": payload.username}]},
+                {"$or": [{"username": username_lower}, {"chesscom_username": username_lower}]},
                 {"_id": 0}
             )
             if profile:
@@ -2225,14 +2229,17 @@ async def analyze_game_endpoint(payload: AnalyzeGameRequest):
                 mist = profile.get("avg_mistakes_per_game", "?")
                 wr   = round((profile.get("winrate") or 0) * 100, 1)
                 elo  = profile.get("chesscom_rating", "?")
+                strengths = profile.get("strengths_ai", [])
                 player_stats_context = (
-                    f"\n\nPROFIL DU JOUEUR (15 dernières parties) :\n"
+                    f"\n\nPROFIL HISTORIQUE DU JOUEUR (sur ses dernières parties analysées) :\n"
                     f"- Rating Chess.com : {elo}\n"
                     f"- Précision moyenne : {round(float(acc), 1)}%\n"
-                    f"- Gaffes/partie : {blun}\n"
-                    f"- Erreurs/partie : {mist}\n"
+                    f"- Gaffes par partie : {blun}\n"
+                    f"- Erreurs par partie : {mist}\n"
                     f"- Winrate : {wr}%\n"
-                    f"- Faiblesses identifiées : {', '.join(wks) if wks else 'non identifiées'}"
+                    f"- Faiblesses récurrentes identifiées : {', '.join(wks) if wks else 'non encore identifiées'}\n"
+                    f"- Points forts : {', '.join([s.get('title','') for s in strengths]) if strengths else 'non identifiés'}\n"
+                    f"IMPORTANT : réfère-toi explicitement à ces stats dans ton analyse pour personnaliser le diagnostic."
                 )
         except Exception:
             pass
@@ -2309,23 +2316,33 @@ async def analyze_game_endpoint(payload: AnalyzeGameRequest):
     # ─── Global game analysis ─────────────────────────────────────────────────
     global_analysis = None
     if ai_client and len(moves_data) > 0:
+        # Calcul précision approx (meilleur-coup = 0 cpl, blunder = cpl élevé)
+        player_moves = [m for m in moves_data if m["is_player_move"]]
+        avg_cpl = round(sum(m["cpl"] for m in player_moves) / max(1, len(player_moves)), 1)
+        best_pct = round(sum(1 for m in player_moves if m["classification"] == "best") / max(1, len(player_moves)) * 100)
+        blunder_count = sum(1 for m in player_moves if m["classification"] == "blunder")
+        mistake_count = sum(1 for m in player_moves if m["classification"] == "mistake")
+
         def _gen_global():
             prompt = (
-                f"Analyse complète d'une partie d'échecs.\n"
+                f"Analyse complète d'une partie d'échecs — style analyse professionnelle chess.com.\n"
                 f"Couleur du joueur : {payload.player_color}\n"
                 f"Total coups : {len(moves_data)} | Coups du joueur : {total_player_moves}\n"
+                f"Stats de cette partie : {blunder_count} gaffe(s), {mistake_count} erreur(s), "
+                f"CPL moyen : {avg_cpl}, {best_pct}% de coups excellents\n"
                 f"Gaffes : {blunder_list}\n"
                 f"Erreurs : {mistake_list}\n"
                 f"Excellents coups : {best_list}"
                 f"{player_stats_context}\n\n"
-                f"Rédige une analyse structurée :\n"
-                f"1. Résumé de la partie (2 phrases)\n"
-                f"2. Tournants critiques (2-3 moments décisifs)\n"
-                f"3. Habitudes révélées (comparer aux stats du joueur si disponibles)\n"
-                f"4. Diagnostic Coach Rasta (brutal, honnête, avec humour)\n"
-                f"5. Plan de travail (2-3 axes prioritaires : thèmes tactiques, "
-                f"structures de pions, types de finales)\n\n"
-                f"Style : Coach Rasta, piquant, décadent, mais ultra-constructif. 180 mots max."
+                f"Rédige une analyse structurée en 5 sections (style chess.com Game Review) :\n"
+                f"📊 Résumé : CPL moyen, précision estimée, verdict global (1-2 phrases)\n"
+                f"♟️ Ouverture : évaluation de la phase d'ouverture (bon/mauvais développement, structure)\n"
+                f"⚔️ Moments clés : les 2-3 coups les plus décisifs avec explication tactique/stratégique\n"
+                f"🔍 Tendances du joueur : compare cette partie aux stats historiques si disponibles "
+                f"(est-ce que les faiblesses récurrentes se manifestent ici ?)\n"
+                f"📈 Plan de progrès : 2-3 axes concrets (thèmes tactiques à travailler, "
+                f"principes stratégiques à appliquer)\n\n"
+                f"Sois précis et factuel. 200 mots max. Français uniquement."
             )
             try:
                 resp = ai_client.chat.completions.create(
