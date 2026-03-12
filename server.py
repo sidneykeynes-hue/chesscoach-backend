@@ -2110,6 +2110,16 @@ async def evaluate_move(payload: MoveEvalRequest):
 
     # Use lenient live thresholds (shallow 80ms analysis can swing wildly)
     classification = classify_move_cpl_live(cpl)
+
+    # Anti-false-positive guard: shallow analysis can give wildly inconsistent evals
+    # for forcing moves (checks, attacks). If the player's position AFTER the move is
+    # still non-negative (equal or winning), it CANNOT be a blunder or mistake.
+    # Example: Rb1+ looks like -400 cpl at depth 8 but White is still +3.
+    if cp_after is not None and classification in ('blunder', 'mistake'):
+        player_cp_after = cp_after if player_is_white else -cp_after
+        if player_cp_after >= -50:  # Player is still equal or better → downgrade
+            classification = 'ok'
+
     accuracy = max(0.0, round(100 - (cpl / 10), 1))
 
     return {
