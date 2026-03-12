@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from dotenv import load_dotenv
@@ -1007,17 +1007,19 @@ async def generate_ai_report(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     def _call():
         system_prompt = (
-            "Tu es un coach d’échecs francophone. Réponds uniquement en français, "
-            "sans jargon technique. Donne des conseils clairs et concrets. "
-            "Retourne uniquement un JSON valide."
+            "Tu es Coach Rasta, un coach d’échecs francophone au style street et décalé. "
+            "Tu parles avec humour, un peu trash, façon grande gueule bienveillante — tu taquines mais tu aides vraiment. "
+            "Tu utilises des expressions familières françaises (fréro, t’as vu, c’est chaud, etc.) mais reste compréhensible. "
+            "Jamais vulgaire, mais pas politiquement correct non plus. Tes conseils sont concrets et directs. "
+            "Retourne uniquement un JSON valide en français."
         )
         user_prompt = (
-            "Génère une analyse lisible et concise à partir des stats suivantes. "
-            "Contraintes: 1) detailed_report: 2-4 paragraphes, chaque paragraphe avec au moins 1 métrique. "
-            "2) short_summary: 1-2 phrases maximum. "
-            "3) strengths: 2 éléments max, chaque élément avec title et detail. "
-            "4) weaknesses: 3 éléments max, chaque élément avec title, detail et advice. "
-            "5) Utilise uniquement des mots français.\n\n"
+            "Génère une analyse à partir des stats suivantes. "
+            "Contraintes: 1) detailed_report: 2-4 paragraphes dans le style Coach Rasta, avec au moins 1 métrique par paragraphe. "
+            "2) short_summary: 1-2 phrases max, style Coach Rasta punchline. "
+            "3) strengths: 2 éléments max avec title et detail. "
+            "4) weaknesses: 3 éléments max avec title, detail et advice. "
+            "5) Tout en français.\n\n"
             f"STATS_JSON={json.dumps(payload, ensure_ascii=False)}"
         )
 
@@ -1292,8 +1294,8 @@ def build_local_ai_report(summary: Dict[str, Any], phase_summary: Dict[str, Any]
     )
 
     short_summary = (
-        f"Précision {avg_accuracy}% avec {winrate}% de victoires et {avg_blunders} gaffes par partie. "
-        f"Ton frein principal est {main_weak}, donc priorise la discipline et les ouvertures."
+        f"Yo fréro, t'as {avg_accuracy}% de précision et {avg_blunders} gaffes par partie — "
+        f"c'est ton {main_weak} qui te plombe. T'as {winrate}% de wins, mais faut bosser frère !"
     )
 
     return {
@@ -2099,6 +2101,111 @@ async def evaluate_move(payload: MoveEvalRequest):
         "mate_before": eval_before.get("mate"),
     }
 
+class AnalyzeGameRequest(BaseModel):
+    pgn: str
+    player_color: str = "white"  # "white" or "black"
+    username: Optional[str] = None
+
+@api_router.post("/analyze-game")
+async def analyze_game_endpoint(payload: AnalyzeGameRequest):
+    """Analyze every move in a PGN. Returns list of annotated moves with
+    stockfish eval + AI commentary for key moments (blunder/mistake)."""
+    from chess.pgn import read_game
+    import io as _io
+
+    pgn_io = _io.StringIO(payload.pgn)
+    game_obj = read_game(pgn_io)
+    if not game_obj:
+        raise HTTPException(status_code=400, detail="PGN invalide")
+
+    board = game_obj.board()
+    player_is_white = payload.player_color.lower() == "white"
+    moves_data = []
+    MAT_CAP = 700
+
+    for node in game_obj.mainline():
+        fen_before = board.fen()
+        move = node.move
+        san = board.san(move)
+        board.push(move)
+        fen_after = board.fen()
+
+        # Stockfish eval (fast, import depth)
+        eval_before = await analyze_position_stockfish(fen_before)
+        eval_after = await analyze_position_stockfish(fen_after)
+
+        cp_b = eval_before.get("cp")
+        cp_a = eval_after.get("cp")
+        if cp_b is not None:
+            cp_b = max(-MAT_CAP, min(MAT_CAP, cp_b))
+        if cp_a is not None:
+            cp_a = max(-MAT_CAP, min(MAT_CAP, cp_a))
+
+        # Determine whose move it was (before push, it was board.turn)
+        move_is_white = not board.turn  # after push, turn flipped
+        is_player_move = (move_is_white == player_is_white)
+
+        cpl = 0.0
+        if cp_b is not None and cp_a is not None:
+            if move_is_white:
+                cpl = max(0.0, cp_b - cp_a)
+            else:
+                cpl = max(0.0, cp_a - cp_b)
+
+        classification = classify_move_cpl(cpl) if is_player_move else "opponent"
+        best_move = eval_before.get("best_move")
+
+        moves_data.append({
+            "san": san,
+            "fen_after": fen_after,
+            "cp_before": cp_b,
+            "cp_after": cp_a,
+            "cpl": round(cpl, 1),
+            "classification": classification,
+            "is_player_move": is_player_move,
+            "best_move": best_move,
+            "comment": None,  # filled below for key moments
+        })
+
+    # AI comments for key player moments (blunders + first mistake)
+    key_indices = [
+        i for i, m in enumerate(moves_data)
+        if m["is_player_move"] and m["classification"] in ("blunder", "mistake")
+    ][:4]  # limit to 4 AI calls
+
+    if client and key_indices:
+        def _gen_comments():
+            comments = {}
+            for idx in key_indices:
+                m = moves_data[idx]
+                prompt = (
+                    f"Coach Rasta, commente ce coup aux échecs en 1-2 phrases max, style street bienveillant. "
+                    f"Coup joué: {m['san']}, classification: {m['classification']}, "
+                    f"perte: {m['cpl']} centipions, meilleur coup était: {m['best_move'] or 'inconnu'}."
+                )
+                try:
+                    resp = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "Tu es Coach Rasta, coach d'échecs street et drôle. Réponds en français, 1-2 phrases max."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        max_tokens=80,
+                        temperature=0.8,
+                    )
+                    comments[idx] = resp.choices[0].message.content.strip()
+                except Exception:
+                    comments[idx] = None
+            return comments
+
+        loop = asyncio.get_event_loop()
+        comments_map = await loop.run_in_executor(None, _gen_comments)
+        for idx, comment in comments_map.items():
+            moves_data[idx]["comment"] = comment
+
+    return {"moves": moves_data, "total": len(moves_data)}
+
+
 @api_router.post("/coach/move")
 async def coach_move(payload: CoachMoveRequest):
     engine = await stockfish_pool.get()
@@ -2561,6 +2668,75 @@ async def get_openings():
             {"id": "pirc-defense", "eco": "B07", "name": "Défense Pirc", "color": "black", "difficulty": "intermédiaire"},
         ]
     }
+
+# --------------------------------------------------------------------------- #
+# RevenueCat webhook — called by RevenueCat when a purchase/renewal happens   #
+# --------------------------------------------------------------------------- #
+REVENUECAT_WEBHOOK_SECRET = os.getenv("REVENUECAT_WEBHOOK_SECRET", "")
+
+# Event types that grant premium access
+_RC_PREMIUM_EVENTS = {
+    "INITIAL_PURCHASE",
+    "RENEWAL",
+    "PRODUCT_CHANGE",
+    "UNCANCELLATION",
+    "SUBSCRIBER_ALIAS",
+    "NON_SUBSCRIPTION_PURCHASE",
+}
+
+# Event types that revoke premium access
+_RC_REVOKE_EVENTS = {
+    "EXPIRATION",
+    "CANCELLATION",
+    "BILLING_ISSUE",
+}
+
+@api_router.post("/webhook/revenuecat")
+async def revenuecat_webhook(request: Request):
+    """
+    Receives RevenueCat events and updates the user's is_premium flag in MongoDB.
+
+    Configure in RevenueCat dashboard:
+      URL: https://<your-domain>/api/webhook/revenuecat
+      Authorization header: Bearer <REVENUECAT_WEBHOOK_SECRET>
+    """
+    # Validate authorization header (if secret is configured)
+    if REVENUECAT_WEBHOOK_SECRET:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header != f"Bearer {REVENUECAT_WEBHOOK_SECRET}":
+            raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    body = await request.json()
+    event = body.get("event", {})
+    event_type = event.get("type", "")
+    # RevenueCat sends app_user_id as the user identifier
+    app_user_id = event.get("app_user_id") or event.get("original_app_user_id")
+
+    if not app_user_id:
+        return {"status": "ignored", "reason": "no app_user_id"}
+
+    if event_type in _RC_PREMIUM_EVENTS:
+        await db.user_usage.update_one(
+            {"user_id": app_user_id},
+            {
+                "$set": {"is_premium": True, "premium_since": datetime.utcnow()},
+                "$setOnInsert": {"user_id": app_user_id, "imports_count": 0, "created_at": datetime.utcnow()},
+            },
+            upsert=True,
+        )
+        logger.info(f"[RevenueCat] Premium granted: {app_user_id} ({event_type})")
+        return {"status": "premium_granted", "user_id": app_user_id}
+
+    if event_type in _RC_REVOKE_EVENTS:
+        await db.user_usage.update_one(
+            {"user_id": app_user_id},
+            {"$set": {"is_premium": False}},
+        )
+        logger.info(f"[RevenueCat] Premium revoked: {app_user_id} ({event_type})")
+        return {"status": "premium_revoked", "user_id": app_user_id}
+
+    return {"status": "ignored", "event_type": event_type}
+
 
 # Include the router in the main app
 app.include_router(api_router)
