@@ -2198,31 +2198,97 @@ async def analyze_game_endpoint(payload: AnalyzeGameRequest):
             "comment": None,  # filled below for key moments
         })
 
-    # AI comments for key player moments (blunders + first mistake)
+    # ─── Coach Rasta system prompt ────────────────────────────────────────────
+    RASTA_SYSTEM = (
+        "Tu es Coach Rasta — coach d'échecs exigeant, analytique et un peu décadent. "
+        "Tu analyses les parties avec profondeur, humour piquant et sévérité bienveillante. "
+        "Style : direct, parfois brutal, toujours constructif. Métaphores absurdes bienvenues. "
+        "Tu ne ménages pas tes mots mais tu veux vraiment que le joueur progresse. "
+        "Règles : analyse la position AVANT le coup joué ; identifie le plan stratégique du joueur "
+        "vs le plan correct ; relie les erreurs aux tendances récurrentes du joueur si possible ; "
+        "distingue erreur tactique / erreur stratégique / mauvais plan. "
+        "Langue : français uniquement."
+    )
+
+    # ─── Fetch player profile for contextual analysis ─────────────────────────
+    player_stats_context = ""
+    if payload.username:
+        try:
+            profile = await db.player_profiles.find_one(
+                {"$or": [{"username": payload.username}, {"chesscom_username": payload.username}]},
+                {"_id": 0}
+            )
+            if profile:
+                wks = profile.get("weaknesses", [])
+                acc  = profile.get("avg_accuracy", 0)
+                blun = profile.get("avg_blunders_per_game", "?")
+                mist = profile.get("avg_mistakes_per_game", "?")
+                wr   = round((profile.get("winrate") or 0) * 100, 1)
+                elo  = profile.get("chesscom_rating", "?")
+                player_stats_context = (
+                    f"\n\nPROFIL DU JOUEUR (15 dernières parties) :\n"
+                    f"- Rating Chess.com : {elo}\n"
+                    f"- Précision moyenne : {round(float(acc), 1)}%\n"
+                    f"- Gaffes/partie : {blun}\n"
+                    f"- Erreurs/partie : {mist}\n"
+                    f"- Winrate : {wr}%\n"
+                    f"- Faiblesses identifiées : {', '.join(wks) if wks else 'non identifiées'}"
+                )
+        except Exception:
+            pass
+
+    # ─── Build stats for global analysis ──────────────────────────────────────
+    total_player_moves = sum(1 for m in moves_data if m["is_player_move"])
+    blunder_list = ", ".join(
+        f"{m['san']} (coup {i//2+1})"
+        for i, m in enumerate(moves_data)
+        if m["is_player_move"] and m["classification"] == "blunder"
+    ) or "aucune"
+    mistake_list = ", ".join(
+        f"{m['san']} (coup {i//2+1})"
+        for i, m in enumerate(moves_data)
+        if m["is_player_move"] and m["classification"] == "mistake"
+    ) or "aucune"
+    best_list = ", ".join(
+        f"{m['san']} (coup {i//2+1})"
+        for i, m in enumerate(moves_data)
+        if m["is_player_move"] and m["classification"] == "best"
+    ) or "aucun"
+
+    # ─── Per-move AI comments (blunders + mistakes + brilliants, max 5) ───────
     key_indices = [
         i for i, m in enumerate(moves_data)
-        if m["is_player_move"] and m["classification"] in ("blunder", "mistake")
-    ][:4]  # limit to 4 AI calls
+        if m["is_player_move"] and m["classification"] in ("blunder", "mistake", "brilliant")
+    ][:5]
 
     if client and key_indices:
         def _gen_comments():
             comments = {}
+            fens = [moves_data[i]["fen_after"] for i in range(len(moves_data))]
+            START = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
             for idx in key_indices:
                 m = moves_data[idx]
+                fen_before = fens[idx - 1] if idx > 0 else START
+                move_num = idx // 2 + 1
                 prompt = (
-                    f"Coach Rasta, commente ce coup aux échecs en 1-2 phrases max, style street bienveillant. "
-                    f"Coup joué: {m['san']}, classification: {m['classification']}, "
-                    f"perte: {m['cpl']} centipions, meilleur coup était: {m['best_move'] or 'inconnu'}."
+                    f"Coup {move_num} joué : {m['san']} "
+                    f"({m['classification']}, {round(float(m['cpl']), 0)} centipions perdus).\n"
+                    f"Meilleur coup : {m['best_move'] or 'inconnu'}.\n"
+                    f"Position FEN avant le coup : {fen_before}"
+                    f"{player_stats_context}\n\n"
+                    f"En 2-3 phrases : analyse la position, explique pourquoi ce coup est "
+                    f"{m['classification']}, et relie à une habitude du joueur si pertinent. "
+                    f"Style Coach Rasta."
                 )
                 try:
                     resp = client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[
-                            {"role": "system", "content": "Tu es Coach Rasta, coach d'échecs street et drôle. Réponds en français, 1-2 phrases max."},
+                            {"role": "system", "content": RASTA_SYSTEM},
                             {"role": "user", "content": prompt},
                         ],
-                        max_tokens=80,
-                        temperature=0.8,
+                        max_tokens=130,
+                        temperature=0.85,
                     )
                     comments[idx] = resp.choices[0].message.content.strip()
                 except Exception:
@@ -2234,7 +2300,45 @@ async def analyze_game_endpoint(payload: AnalyzeGameRequest):
         for idx, comment in comments_map.items():
             moves_data[idx]["comment"] = comment
 
-    return {"moves": moves_data, "total": len(moves_data)}
+    # ─── Global game analysis ─────────────────────────────────────────────────
+    global_analysis = None
+    if client and len(moves_data) > 0:
+        def _gen_global():
+            prompt = (
+                f"Analyse complète d'une partie d'échecs.\n"
+                f"Couleur du joueur : {payload.player_color}\n"
+                f"Total coups : {len(moves_data)} | Coups du joueur : {total_player_moves}\n"
+                f"Gaffes : {blunder_list}\n"
+                f"Erreurs : {mistake_list}\n"
+                f"Excellents coups : {best_list}"
+                f"{player_stats_context}\n\n"
+                f"Rédige une analyse structurée :\n"
+                f"1. Résumé de la partie (2 phrases)\n"
+                f"2. Tournants critiques (2-3 moments décisifs)\n"
+                f"3. Habitudes révélées (comparer aux stats du joueur si disponibles)\n"
+                f"4. Diagnostic Coach Rasta (brutal, honnête, avec humour)\n"
+                f"5. Plan de travail (2-3 axes prioritaires : thèmes tactiques, "
+                f"structures de pions, types de finales)\n\n"
+                f"Style : Coach Rasta, piquant, décadent, mais ultra-constructif. 180 mots max."
+            )
+            try:
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": RASTA_SYSTEM},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=400,
+                    temperature=0.85,
+                )
+                return resp.choices[0].message.content.strip()
+            except Exception:
+                return None
+
+        loop = asyncio.get_event_loop()
+        global_analysis = await loop.run_in_executor(None, _gen_global)
+
+    return {"moves": moves_data, "total": len(moves_data), "global_analysis": global_analysis}
 
 
 @api_router.post("/coach/move")
