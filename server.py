@@ -883,7 +883,8 @@ async def analyze_position_stockfish(fen: str) -> Dict[str, Any]:
             info = engine.analyse(board, limit)
             score = info["score"].white()
             mate = score.mate()
-            cp = score.cp if mate is None else (10000 if mate > 0 else -10000)
+            # mate >= 0 covers Mate(0) = checkmate already delivered (White wins)
+            cp = score.cp if mate is None else (10000 if mate >= 0 else -10000)
             pv = info.get("pv", [])
             best_move = pv[0].uci() if pv else None
             return {"cp": cp, "mate": mate, "best_move": best_move}
@@ -1637,7 +1638,8 @@ async def analyze_game_stockfish(
                 mate = score.mate()
                 cp = score.cp if mate is None else None
                 if mate is not None:
-                    cp = 10000 if mate > 0 else -10000
+                    # mate >= 0: covers Mate(0) = checkmate already delivered (White wins)
+                    cp = 10000 if mate >= 0 else -10000
                 pv = info.get("pv", [])
                 best_move = pv[0].uci() if pv else None
                 return {"cp": cp, "mate": mate, "best_move": best_move}
@@ -2066,6 +2068,25 @@ async def get_chesscom_stats(username: str):
 @api_router.post("/coach/evaluate-move")
 async def evaluate_move(payload: MoveEvalRequest):
     player_is_white = payload.player_color.lower() == "white"
+
+    # Fast-path: if the position after the move is already checkmate, it's a brilliant move.
+    # We check this with python-chess directly — no need to call Stockfish on a dead position.
+    try:
+        _board_after = chess.Board(payload.fen_after)
+        if _board_after.is_checkmate():
+            eval_before = await analyze_position_stockfish(payload.fen_before)
+            return {
+                "cp_before": 700,
+                "cp_after": 700,
+                "cpl": 0.0,
+                "classification": "brilliant",
+                "accuracy": 100.0,
+                "best_move": eval_before.get("best_move"),
+                "mate_before": eval_before.get("mate"),
+            }
+    except Exception:
+        pass  # Invalid FEN — fall through to normal analysis
+
     eval_before = await analyze_position_stockfish(payload.fen_before)
     eval_after = await analyze_position_stockfish(payload.fen_after)
 
@@ -2593,7 +2614,7 @@ async def get_chesscom_games(user_id: str, username: Optional[str] = None, limit
     if username:
         query["username"] = username.lower()
 
-    games = await db.chesscom_games.find(query, {"pgn": 0, "_id": 0}).sort("end_time", -1).limit(limit).to_list(limit)
+    games = await db.chesscom_games.find(query, {"_id": 0}).sort("end_time", -1).limit(limit).to_list(limit)
     return {"games": games}
 
 @api_router.get("/chessdotcom/profile")
