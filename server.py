@@ -2294,7 +2294,12 @@ async def import_chesscom_games(username: str, payload: Optional[ChessComImportR
 
     months = payload.months if payload.months and payload.months > 0 else 3
     months = min(12, months)
-    username_clean = username.lower()
+    username_clean = username.lower().strip()
+
+    # Validate username: Chess.com allows letters, digits, underscores, hyphens, 3-25 chars
+    import re as _re
+    if not _re.match(r'^[a-z0-9_\-]{3,25}$', username_clean):
+        raise HTTPException(status_code=422, detail="Nom d'utilisateur Chess.com invalide (3-25 caractères, lettres/chiffres/_/-)")
 
     archives_url = f"https://api.chess.com/pub/player/{username_clean}/games/archives"
     archives_data = await fetch_chesscom_json(archives_url)
@@ -2741,10 +2746,16 @@ async def revenuecat_webhook(request: Request):
 # Include the router in the main app
 app.include_router(api_router)
 
+# CORS — for a mobile app the requests come from the device (not a browser),
+# so wildcard origins are safe. allow_credentials=False is required with allow_origins=["*"].
+# To restrict further (e.g. for a future web app), set ALLOWED_ORIGINS=https://yourdomain.com on Railway.
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "*")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",")] if _raw_origins != "*" else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],
+    allow_credentials=False,
+    allow_origins=_allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
